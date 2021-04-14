@@ -46,6 +46,8 @@ import org.xml.sax.Attributes;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.AttributesImpl;
 
+import javax.annotation.Nullable;
+
 import static com.evolvedbinary.j8fu.tuple.Tuple.Tuple;
 
 /**
@@ -73,9 +75,14 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
     private final PreAllocatedIdReceiver preAllocatedId = new PreAllocatedIdReceiver();
 
     /*
-    Are we creating or updating a document?
+    What action are we undertaking?
     */
-    private boolean createOrUpdate = false;
+    private enum Action {
+        CREATE,
+        UPDATE,
+        OTHER
+    }
+    private Action action = Action.OTHER;
 
     /*
     Guard used to prevent processing group elements
@@ -121,7 +128,7 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
 
     @Override
     public void beforeCreateDocument(final DBBroker broker, final Txn txn, final XmldbURI uri) throws TriggerException {
-        this.createOrUpdate = true;
+        this.action = Action.CREATE;
         this.broker = broker;
     }
 
@@ -144,12 +151,12 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
         }
 
         this.broker = null;
-        this.createOrUpdate = false;
+        this.action = Action.OTHER;
     }
 
     @Override
     public void beforeUpdateDocument(final DBBroker broker, final Txn txn, final DocumentImpl document) throws TriggerException {
-        this.createOrUpdate = true;
+        this.action = Action.UPDATE;
         this.broker = broker;
 
         //check saving list
@@ -189,7 +196,7 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
         }
 
         this.broker = null;
-        this.createOrUpdate = false;
+        this.action = Action.OTHER;
     }
 
     @Override
@@ -238,9 +245,14 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
 	public void configure(final DBBroker broker, final Txn transaction, final Collection parent, final Map<String, List<? extends Object>> parameters) throws TriggerException {
 	}
 
+	private boolean isCreatingOrUpdating() {
+        return action == Action.CREATE
+                || action == Action.UPDATE;
+    }
+
     @Override
     public void startElement(final String namespaceURI, final String localName, final String qname, final Attributes attributes) throws SAXException {
-        if(createOrUpdate && namespaceURI != null && namespaceURI.equals(Configuration.NS) && ( (localName.equals(PrincipalType.ACCOUNT.getElementName()) && attributes.getValue("id") != null )|| (localName.equals(PrincipalType.GROUP.getElementName()) && !processingAccount))) {
+        if(isCreatingOrUpdating() && namespaceURI != null && namespaceURI.equals(Configuration.NS) && ( (localName.equals(PrincipalType.ACCOUNT.getElementName()) && attributes.getValue("id") != null )|| (localName.equals(PrincipalType.GROUP.getElementName()) && !processingAccount))) {
             processingAccount = localName.equals(PrincipalType.ACCOUNT.getElementName()); //set group account/group guard
             defer(true);
         }
@@ -258,7 +270,7 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
 
         super.endElement(namespaceURI, localName, qname);
 
-        if(createOrUpdate && namespaceURI != null && namespaceURI.equals(Configuration.NS) && (localName.equals(PrincipalType.ACCOUNT.getElementName()) || (localName.equals(PrincipalType.GROUP.getElementName()) && !processingAccount))) {
+        if(isCreatingOrUpdating() && namespaceURI != null && namespaceURI.equals(Configuration.NS) && (localName.equals(PrincipalType.ACCOUNT.getElementName()) || (localName.equals(PrincipalType.GROUP.getElementName()) && !processingAccount))) {
 
             //we have now captured the entire account or group in our deferred queue,
             //so we can now process it in it's entirety
@@ -329,51 +341,68 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
 
         final SecurityManager sm = broker.getBrokerPool().getSecurityManager();
 
-        //if needed, update old style id to new style id
         final AttributesImpl attrs = new AttributesImpl(migrateIdAttribute(sm, start.attributes, principalType));
 
-        //check if there is a name collision, i.e. another principal with the same name
-        final String principalName = findName();
-        // first check if the account or group exists before trying to retrieve it
-        // otherwise the LDAP realm will create a new user, leading to an endless loop
-        final boolean principalExists = principalName != null && principalType.hasPrincipal(sm, principalName);
-        Principal existingPrincipleByName = null;
-        if (principalExists) {
-            existingPrincipleByName = principalType.getPrincipal(sm, principalName);
-        }
-
         final int newId;
-        if(existingPrincipleByName != null) {
-            //use id of existing principal which has the same name
-            newId = existingPrincipleByName.getId();
-        } else {
+        if (action == Action.UPDATE) {
+            // use id of existing principal
+            newId = Integer.valueOf(attrs.getValue(ID_ATTR));
 
-            //check if there is an id collision, i.e. another principal with the same id
-            final Integer id = Integer.valueOf(attrs.getValue(ID_ATTR));
-            final boolean principalIdExists = principalType.hasPrincipal(sm, id);
-            Principal existingPrincipalById = null;
-            if (principalIdExists) {
-                existingPrincipalById = principalType.getPrincipal(sm, id);
+            //check if there is a name collision, i.e. another principal with the same name but a different id
+            final String principalName = findName();
+            final boolean principalNameExists = principalName != null && principalType.hasPrincipal(sm, principalName);
+            if (principalNameExists) {
+                final Principal existingPrincipleByName = principalType.getPrincipal(sm, principalName);
+                if (existingPrincipleByName.getId() != newId) {
+                    throw new SAXException("A Principal with name '" + principalName + "' already exists");
+                }
             }
 
-            if(existingPrincipalById != null) {
+        } else {
+            //if needed, update old style id to new style id
 
-                //pre-allocate a new id, so as not to collide with the existing principal
-                if(isValidating()) {
-                    try {
-                        principalType.preAllocateId(sm, preAllocatedId);
-                    } catch(final PermissionDeniedException | EXistException e) {
-                        throw new SAXException("Unable to pre-allocate principle id for " + principalType.getElementName() + ": " + principalName, e);
-                    }
-                }
+            //check if there is a name collision, i.e. another principal with the same name
+            final String principalName = findName();
+            // first check if the account or group exists before trying to retrieve it
+            // otherwise the LDAP realm will create a new user, leading to an endless loop
+            final boolean principalNameExists = principalName != null && principalType.hasPrincipal(sm, principalName);
+            Principal existingPrincipleByName = null;
+            if (principalNameExists) {
+                existingPrincipleByName = principalType.getPrincipal(sm, principalName);
+            }
 
-                newId = preAllocatedId.getId();
-
-                if(!isValidating()) {
-                    preAllocatedId.clear();
-                }
+            if (existingPrincipleByName != null) {
+                //use id of existing principal which has the same name
+                newId = existingPrincipleByName.getId();
             } else {
-                newId = id; //use the provided id as it is currently unallocated
+
+                //check if there is an id collision, i.e. another principal with the same id
+                final Integer id = Integer.valueOf(attrs.getValue(ID_ATTR));
+                final boolean principalIdExists = principalType.hasPrincipal(sm, id);
+                Principal existingPrincipalById = null;
+                if (principalIdExists) {
+                    existingPrincipalById = principalType.getPrincipal(sm, id);
+                }
+
+                if (existingPrincipalById != null) {
+
+                    //pre-allocate a new id, so as not to collide with the existing principal
+                    if (isValidating()) {
+                        try {
+                            principalType.preAllocateId(sm, preAllocatedId);
+                        } catch (final PermissionDeniedException | EXistException e) {
+                            throw new SAXException("Unable to pre-allocate principle id for " + principalType.getElementName() + ": " + principalName, e);
+                        }
+                    }
+
+                    newId = preAllocatedId.getId();
+
+                    if (!isValidating()) {
+                        preAllocatedId.clear();
+                    }
+                } else {
+                    newId = id; //use the provided id as it is currently unallocated
+                }
             }
         }
 
@@ -419,7 +448,7 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
      *
      * @return The text value of the name element, or null otherwise
      */
-    private String findName() {
+    private @Nullable String findName() {
         boolean inName = false;
         final StringBuilder name = new StringBuilder();
         for (final SAXEvent event : deferred) {
@@ -440,6 +469,30 @@ public class ConfigurationDocumentTrigger extends DeferrableFilteringTrigger {
         } else {
             return null;
         }
+    }
+
+    /**
+     * Attempts to find and extract the value
+     * of the id attribute from the deferred elements
+     *
+     * @return The value of the id element, or null otherwise
+     */
+    private @Nullable Integer findId() {
+        for (final SAXEvent event : deferred) {
+            if (event instanceof StartElement) {
+                final StartElement element = (StartElement) event;
+                if (element.namespaceURI != null && element.namespaceURI.equals(Configuration.NS) && element.localName.equals("account")) {
+                    if (element.attributes != null) {
+                        final String value = element.attributes.getValue("id");
+                        if (value != null && !value.isEmpty()) {
+                            return Integer.valueOf(value);
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
