@@ -112,14 +112,15 @@ public abstract class AbstractRealm implements Realm, Configurable {
                 final Configuration conf = Configurator.parse(broker.getBrokerPool(), doc);
                 final String name = conf.getProperty("name");
                 
-                groupsByName.writeE(principalDb -> {
-                    if(name != null && !principalDb.containsKey(name)) {
+                groupsById.writeE(principalNamesDb -> {
+                    if(name != null && !principalNamesDb.containsKey(name)) {
 
                         //Group group = instantiateGroup(this, conf);
                         final GroupImpl group = new GroupImpl(r, conf);
 
                         getSecurityManager().registerGroup(group);
-                        principalDb.put(group.getName(), group);
+                        principalNamesDb.put(group.getId(), group);
+                        groupsByName.write(principalIdsDb -> principalIdsDb.put(group.getName(), group));
 
                         //set collection
                         if(group.getId() > 0) {
@@ -271,12 +272,13 @@ public abstract class AbstractRealm implements Realm, Configurable {
     }
     
     public final Group registerGroup(final Group group) {
-        groupsByName.write(principalDb -> {
-            if(principalDb.containsKey(group.getName())) {
+        groupsById.write(principalDb -> {
+            if(principalDb.containsKey(group.getId())) {
                 throw new IllegalArgumentException("Group " + group.getName() + " already exists.");
             }
 
-            principalDb.put(group.getName(), group);
+            principalDb.put(group.getId(), group);
+            groupsByName.write(principalIdsDb -> principalIdsDb.put(group.getName(), group));
         });
         
         return group;   
@@ -488,7 +490,7 @@ public abstract class AbstractRealm implements Realm, Configurable {
         group.assertCanModifyGroup(user);
 
         //modify the group
-        final Group updatingGroup = getGroup(group.getName());
+        final Group updatingGroup = getGroup(group.getId());
         if(updatingGroup == null) {
             throw new PermissionDeniedException("group " + group.getName() + " does not exist");
         }
@@ -514,8 +516,26 @@ public abstract class AbstractRealm implements Realm, Configurable {
                 updatingGroup.setMetadataValue(key, group.getMetadataValue(key));
             }
         }    
-
-        updatingGroup.save();
+        try {
+            updatingGroup.save();
+        } finally {
+            final String oldName = groupsByName.read(groupsDb -> {
+                for (final Group oldGroup : groupsDb.values()) {
+                    for (Map.Entry<String, Group> entry : groupsDb.entrySet()) {
+                        if (group.getId() == entry.getValue().getId()) {
+                            return entry.getKey();
+                        }
+                    }
+                }
+                return null;
+            });
+            groupsByName.write(principalNamesDb -> {
+                if (oldName != null) {
+                    principalNamesDb.remove(oldName);
+                }
+                principalNamesDb.put(group.getName(), group);
+            });
+        }
 
         return true;
     }
